@@ -15,55 +15,64 @@ import matplotlib.pyplot as plt
 # -----------------------------
 
 # --- 繪圖輔助函數 (維持存檔) ---
-def plot_facelock_history(history):
-    """
-    專門用來繪製 facelock 函數回傳的 history 字典
-    """
-    print("Plotting losses...")
+# 請覆蓋 methods.py 中的 plot_facelock_history 函式
 
-    # 建立一個 2x2 的圖表方格
-    plt.figure(figsize=(12, 10))
-    plt.suptitle('FaceLock Loss Convergence', fontsize=16)
+def plot_facelock_history(history):
+    print("Plotting losses...")
+    
+    # 檢查是否有 LPIPS 數據，決定要畫幾張圖
+    has_lpips = 'loss_lpips' in history and len(history['loss_lpips']) > 0
+    
+    if has_lpips:
+        # 如果有 4 個數據，維持原本的 2x2 版面
+        plt.figure(figsize=(12, 10))
+        layout = (2, 2)
+    else:
+        # 如果只有 3 個數據 (極致模式)，改用 1x3 版面
+        plt.figure(figsize=(18, 5))
+        layout = (1, 3)
+
+    plt.suptitle('FaceLock Loss Convergence (Aggressive Mode)', fontsize=16)
 
     # 圖 1: Total Loss
-    plt.subplot(2, 2, 1)
+    plt.subplot(layout[0], layout[1], 1)
     plt.plot(history['total_loss'])
     plt.title('Total Loss')
     plt.xlabel('Iteration')
     plt.ylabel('Loss')
     plt.grid(True)
 
-    # 圖 2: CVL Loss (人臉辨識分數)
-    plt.subplot(2, 2, 2)
+    # 圖 2: CVL Loss (人臉辨識分數 - 越低越好)
+    plt.subplot(layout[0], layout[1], 2)
     plt.plot(history['loss_cvl'], color='red')
     plt.title('Face Recognition Score (loss_cvl)')
     plt.xlabel('Iteration')
-    plt.ylabel('Score')
+    plt.ylabel('Score (Lower is Better)')
     plt.grid(True)
 
-    # 圖 3: Encoder Loss (潛在空間距離)
-    plt.subplot(2, 2, 3)
+    # 圖 3: Encoder Loss (特徵破壞程度 - 越高越好)
+    plt.subplot(layout[0], layout[1], 3)
     plt.plot(history['loss_encoder'], color='green')
-    plt.title('Encoder MSE Loss (loss_encoder)')
+    plt.title('Encoder MSE Loss (Disruption)')
     plt.xlabel('Iteration')
-    plt.ylabel('Loss')
+    plt.ylabel('Loss (Higher is Better)')
     plt.grid(True)
 
-    # 圖 4: LPIPS Loss (影像感知相似度)
-    plt.subplot(2, 2, 4)
-    plt.plot(history['loss_lpips'], color='purple')
-    plt.title('Perceptual Similarity (loss_lpips)')
-    plt.xlabel('Iteration')
-    plt.ylabel('Loss')
-    plt.grid(True)
+    # 圖 4: LPIPS (如果有才畫)
+    if has_lpips:
+        plt.subplot(2, 2, 4)
+        plt.plot(history['loss_lpips'], color='purple')
+        plt.title('Perceptual Similarity (loss_lpips)')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.grid(True)
 
-    # 調整排版並儲存圖表
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     
     save_path = "facelock_loss_convergence.png"
     plt.savefig(save_path) 
     print(f"Loss plot saved to: {save_path}")
-    # plt.show() # 在 Agg 模式下無法運作
+    plt.close() # 關閉圖表釋放記憶體
 # -----------------------------
 
 
@@ -169,49 +178,66 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
 
     return X_adv, history 
 
-def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clamp_max=1, plot_history=False): 
-    X_adv = torch.clamp(X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).to(X.device), min=clamp_min, max=clamp_max).half()
-    pbar = tqdm(range(iters))
+# 請將這段程式碼覆蓋 methods.py 中的 facelock 函式
+
+def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.07, step_size=0.01, iters=100, clamp_min=-1, clamp_max=1, plot_history=False, tv_weight=0): 
+    # [設定] 極致攻擊模式
+    # 這裡直接對圖片進行梯度上升 (Gradient Ascent)，最大化 Loss
     
+    X_adv = X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).to(X.device)
+    X_adv = torch.clamp(X_adv, min=clamp_min, max=clamp_max).half()
+    X_adv.requires_grad = True
+
     vae = model.vae
-    X_adv.requires_grad_(True)
-    clean_latent = vae.encode(X).latent_dist.mean
+    # 鎖定原始潛在特徵，我們稍後要讓圖片偏離這個特徵，以防被編輯還原
+    clean_latent = vae.encode(X).latent_dist.mean.detach()
 
-    momentum = torch.zeros_like(X_adv).detach() 
-    mu = 1.0
+    history = {'total_loss': [], 'loss_cvl': [], 'loss_encoder': []}
+    pbar = tqdm(range(iters))
 
-    history = {
-        'total_loss': [],
-        'loss_cvl': [],
-        'loss_encoder': [],
-        'loss_lpips': []
-    }
+    print(f"啟動極致隱私模式 (Aggressive Privacy): eps={eps}")
 
     for i in pbar:
-        actual_step_size = step_size - (step_size - step_size / 100) / iters * i
-        
+        # 1. 取得當前圖片特徵
         latent = vae.encode(X_adv).latent_dist.mean
-        image = vae.decode(latent).sample.clip(-1, 1)
+        image_recon = vae.decode(latent).sample.clip(-1, 1)
 
-        loss_cvl = compute_score(image.float(), X.float(), aligner=aligner, fr_model=fr_model)
+        # 2. 計算 Loss
+        # (A) 人臉辨識分數 (我們希望這個分數越低越好 -> Maximize -loss_cvl)
+        loss_cvl = compute_score(image_recon.float(), X.float(), aligner=aligner, fr_model=fr_model)
+        
+        # (B) 潛在空間距離 (我們希望這個距離越大越好 -> Maximize loss_encoder)
+        # 這是為了讓 Stable Diffusion 等編輯軟體讀到錯誤資訊
         loss_encoder = F.mse_loss(latent, clean_latent)
-        loss_lpips = lpips_fn(image, X)
-        loss = -loss_cvl * (2 if i >= iters * 0.35 else 0.0) + loss_encoder * 0.2 + loss_lpips * (1 if i > iters * 0.25 else 0.0)
+        
+        # [關鍵]：移除 LPIPS 限制。我們不在意畫質，所以不需要花預算去維持相似度，
+        # 也不需要花預算去故意製造視覺差異。讓預算全用在刀口上。
+
+        # 權重分配：全力攻擊人臉 (CVL)，輔助攻擊特徵 (Encoder)
+        # 這裡使用梯度上升邏輯
+        loss = -loss_cvl * 5.0 + loss_encoder *1.0
+
         grad, = torch.autograd.grad(loss, [X_adv])
-        X_adv = X_adv + grad.detach().sign() * actual_step_size
+        
+        # 3. 更新圖片 (使用 sign() 進行最強攻擊)
+        X_adv.data = X_adv.data + step_size * grad.sign()
 
-        X_adv = torch.minimum(torch.maximum(X_adv, X - eps), X + eps)
-        X_adv.data = torch.clamp(X_adv, min=clamp_min, max=clamp_max)
-        X_adv.grad = None
+        # 4. 限制範圍 (Projected Gradient Descent)
+        # 確保雜訊不超過 eps，但會充分利用 eps 空間
+        X_adv.data = torch.max(torch.min(X_adv.data, X + eps), X - eps)
+        X_adv.data = torch.clamp(X_adv.data, min=clamp_min, max=clamp_max)
 
-        pbar.set_postfix(loss_cvl=loss_cvl.item(), loss_encoder=loss_encoder.item(), loss_lpips=loss_lpips.item(), loss=loss.item())
-
+        # 記錄
+        pbar.set_postfix(cvl=f"{loss_cvl.item():.3f}", enc=f"{loss_encoder.item():.3f}")
         history['total_loss'].append(loss.item())
         history['loss_cvl'].append(loss_cvl.item())
         history['loss_encoder'].append(loss_encoder.item())
-        history['loss_lpips'].append(loss_lpips.item())
 
     if plot_history:
-        plot_facelock_history(history)
+        # 修改繪圖函式以適應缺少 lpips 的情況，或者直接忽略報錯
+        try:
+            plot_facelock_history(history)
+        except:
+            pass
 
     return X_adv, history
