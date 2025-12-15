@@ -177,6 +177,9 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.03, step_size=0.01, it
     X_adv.requires_grad_(True)
     clean_latent = vae.encode(X).latent_dist.mean
 
+    momentum = torch.zeros_like(X_adv).detach() 
+    mu = 1.0
+
     history = {
         'total_loss': [],
         'loss_cvl': [],
