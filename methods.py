@@ -14,9 +14,43 @@ import matplotlib
 import matplotlib.pyplot as plt
 # -----------------------------
 
-# --- 繪圖輔助函數 (維持存檔) ---
-# 請覆蓋 methods.py 中的 plot_facelock_history 函式
+# ==========================================
+# [新增] DIM (Diverse Inputs Method) 輔助函式
+# ==========================================
+def input_diversity(x, resize_rate=0.9, diversity_prob=0.7):
+    """
+    DIM 實作：隨機縮放與補邊，增加攻擊強健性
+    """
+    # 1. 決定是否執行 DIM (有 1-diversity_prob 的機率不執行，直接回傳原圖)
+    if torch.rand(1) > diversity_prob:
+        return x
 
+    img_size = x.shape[-1]
+    img_resize = int(img_size * resize_rate)
+    
+    # 2. 隨機決定縮放後的大小
+    rnd = torch.randint(low=img_resize, high=img_size, size=(1,)).item()
+    
+    # 3. 縮放圖片
+    rescaled = F.interpolate(x, size=(rnd, rnd), mode='bilinear', align_corners=False)
+    
+    # 4. 計算需要補邊 (Padding) 的大小
+    h_rem = img_size - rnd
+    w_rem = img_size - rnd
+    
+    pad_top = torch.randint(0, h_rem + 1, (1,)).item()
+    pad_bottom = h_rem - pad_top
+    pad_left = torch.randint(0, w_rem + 1, (1,)).item()
+    pad_right = w_rem - pad_left
+    
+    # 5. 補邊回原本大小，並補 0 (黑色)
+    padded = F.pad(rescaled, (pad_left, pad_right, pad_top, pad_bottom), value=0)
+    
+    return padded
+# ==========================================
+
+
+# --- 繪圖輔助函數 ---
 def plot_facelock_history(history):
     print("Plotting losses...")
     
@@ -32,7 +66,7 @@ def plot_facelock_history(history):
         plt.figure(figsize=(18, 5))
         layout = (1, 3)
 
-    plt.suptitle('FaceLock Loss Convergence (Aggressive Mode)', fontsize=16)
+    plt.suptitle('FaceLock Loss Convergence (Aggressive + DIM Mode)', fontsize=16)
 
     # 圖 1: Total Loss
     plt.subplot(layout[0], layout[1], 1)
@@ -178,52 +212,52 @@ def vae_attack(X, model, eps=0.03, step_size=0.01, iters=100, clamp_min=-1, clam
 
     return X_adv, history 
 
-# 請將這段程式碼覆蓋 methods.py 中的 facelock 函式
 
+# ==============================================================
+# [修改後] 整合了 DIM (Diverse Inputs Method) 的 Facelock 函式
+# ==============================================================
 def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.07, step_size=0.01, iters=100, clamp_min=-1, clamp_max=1, plot_history=False, tv_weight=0): 
-    # [設定] 極致攻擊模式
-    # 這裡直接對圖片進行梯度上升 (Gradient Ascent)，最大化 Loss
+    # [設定] 極致攻擊模式 + DIM
     
     X_adv = X.clone().detach() + (torch.rand(*X.shape)*2*eps-eps).to(X.device)
     X_adv = torch.clamp(X_adv, min=clamp_min, max=clamp_max).half()
     X_adv.requires_grad = True
 
     vae = model.vae
-    # 鎖定原始潛在特徵，我們稍後要讓圖片偏離這個特徵，以防被編輯還原
     clean_latent = vae.encode(X).latent_dist.mean.detach()
 
     history = {'total_loss': [], 'loss_cvl': [], 'loss_encoder': []}
     pbar = tqdm(range(iters))
 
-    print(f"啟動極致隱私模式 (Aggressive Privacy): eps={eps}")
+    print(f"啟動極致隱私模式 (Aggressive Privacy with DIM): eps={eps}")
 
     for i in pbar:
-        # 1. 取得當前圖片特徵
+        # 1. 取得當前圖片特徵與重建圖
         latent = vae.encode(X_adv).latent_dist.mean
         image_recon = vae.decode(latent).sample.clip(-1, 1)
 
+        # ================= [新增] DIM 隨機變形 =================
+        # 對要算分數的圖片進行隨機縮放，增加泛化能力
+        image_dim = input_diversity(image_recon, resize_rate=0.9, diversity_prob=0.7)
+        # ======================================================
+
         # 2. 計算 Loss
-        # (A) 人臉辨識分數 (我們希望這個分數越低越好 -> Maximize -loss_cvl)
-        loss_cvl = compute_score(image_recon.float(), X.float(), aligner=aligner, fr_model=fr_model)
+        # (A) 人臉辨識分數 (使用變形後的 image_dim 計算)
+        # 這能模擬 "如果圖片被縮放或上傳到FB被壓縮，是否還能防禦成功?"
+        loss_cvl = compute_score(image_dim.float(), X.float(), aligner=aligner, fr_model=fr_model)
         
-        # (B) 潛在空間距離 (我們希望這個距離越大越好 -> Maximize loss_encoder)
-        # 這是為了讓 Stable Diffusion 等編輯軟體讀到錯誤資訊
+        # (B) 潛在空間距離 (這不需要 DIM，我們針對原始特徵結構攻擊)
         loss_encoder = F.mse_loss(latent, clean_latent)
         
-        # [關鍵]：移除 LPIPS 限制。我們不在意畫質，所以不需要花預算去維持相似度，
-        # 也不需要花預算去故意製造視覺差異。讓預算全用在刀口上。
-
-        # 權重分配：全力攻擊人臉 (CVL)，輔助攻擊特徵 (Encoder)
-        # 這裡使用梯度上升邏輯
-        loss = -loss_cvl * 5.0 + loss_encoder *1.0
+        # 權重分配 (維持原本設定)
+        loss = -loss_cvl * 5.0 + loss_encoder * 1.0
 
         grad, = torch.autograd.grad(loss, [X_adv])
         
-        # 3. 更新圖片 (使用 sign() 進行最強攻擊)
+        # 3. 更新圖片
         X_adv.data = X_adv.data + step_size * grad.sign()
 
-        # 4. 限制範圍 (Projected Gradient Descent)
-        # 確保雜訊不超過 eps，但會充分利用 eps 空間
+        # 4. 限制範圍
         X_adv.data = torch.max(torch.min(X_adv.data, X + eps), X - eps)
         X_adv.data = torch.clamp(X_adv.data, min=clamp_min, max=clamp_max)
 
@@ -234,7 +268,6 @@ def facelock(X, model, aligner, fr_model, lpips_fn, eps=0.07, step_size=0.01, it
         history['loss_encoder'].append(loss_encoder.item())
 
     if plot_history:
-        # 修改繪圖函式以適應缺少 lpips 的情況，或者直接忽略報錯
         try:
             plot_facelock_history(history)
         except:
